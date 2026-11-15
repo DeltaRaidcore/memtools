@@ -12,17 +12,14 @@
 #include <windows.h>
 
 #include <array>
+#include <cassert>
 #include <cstdint>
+#include <cstring>
 #include <initializer_list>
 #include <psapi.h>
+#include <tlhelp32.h>
+#include <type_traits>
 #include <vector>
-
-/// You can define ENABLE_PATTERN_CACHING which will store the first result matching a given pattern.
-/// This potentially speeds up multiple searches starting with the same pattern.
-//#define ENABLE_PATTERN_CACHING
-#ifdef ENABLE_PATTERN_CACHING
-#include <mutex>
-#endif
 
 #ifndef MAX_PATTERN_LENGTH
 #define MAX_PATTERN_LENGTH     128
@@ -31,13 +28,10 @@
 #ifndef MAX_INSTRUCTION_LENGTH
 #define MAX_INSTRUCTION_LENGTH 16
 #endif
-#define CHAR_0                 0x30 /* ascii value for '0' */
-#define CHAR_9                 0x39 /* ascii value for '9' */
-#define CHAR_A                 0x41 /* ascii value for 'A' */
-#define CHAR_F                 0x46 /* ascii value for 'F' */
-#define HEXVAL_A               10   /* value of hex A */
-#define HEXPOW_1               0x01 /* power of the first digit */
-#define HEXPOW_2               0x10 /* power of the second digit */
+
+#ifndef MAX_JMP_CHAIN
+#define MAX_JMP_CHAIN          32
+#endif
 
 ///----------------------------------------------------------------------------------------------------
 /// memtools Namespace
@@ -55,42 +49,95 @@ namespace memtools
 		return (PBYTE)aAddress + jmpOffset + 4;
 	}
 
+	///----------------------------------------------------------------------------------------------------
+	/// IsReadable:
+	/// 	Returns true if the queried memory region is committed and can be read.
+	///----------------------------------------------------------------------------------------------------
+	inline bool IsReadable(const MEMORY_BASIC_INFORMATION& aInfo)
+	{
+		if (aInfo.State != MEM_COMMIT) { return false; }
+		if (aInfo.Protect & (PAGE_GUARD | PAGE_NOACCESS)) { return false; }
+
+		return (aInfo.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+			PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+	}
+
+	///----------------------------------------------------------------------------------------------------
+	/// ReadFaultFilter:
+	/// 	SEH filter that only handles faults from reading memory that is gone or inaccessible.
+	///----------------------------------------------------------------------------------------------------
+	inline int ReadFaultFilter(DWORD aCode)
+	{
+		switch (aCode)
+		{
+			case EXCEPTION_ACCESS_VIOLATION:
+			case EXCEPTION_IN_PAGE_ERROR:
+			case EXCEPTION_GUARD_PAGE:
+				return EXCEPTION_EXECUTE_HANDLER;
+			default:
+				return EXCEPTION_CONTINUE_SEARCH;
+		}
+	}
+
+	///----------------------------------------------------------------------------------------------------
+	/// FollowJmpChain:
+	/// 	Follows jmps until the first instruction that is none and returns its address.
+	/// 	Returns nullptr if the chain loops, is longer than MAX_JMP_CHAIN or leads to unreadable memory.
+	///----------------------------------------------------------------------------------------------------
 	inline void* FollowJmpChain(PBYTE aPointer)
 	{
-		while (true)
+		__try
 		{
-			if (aPointer[0] == 0xEB)
+			for (int hop = 0; hop <= MAX_JMP_CHAIN; hop++)
 			{
-				/* short jmp */
-				/* address is relative to after jmp */
-				aPointer += 2 + *(__unaligned int8_t*) & aPointer[1]; // jmp +imm8
-			}
-			else if (aPointer[0] == 0xE9)
-			{
-				/* near jmp */
-				/* address is relative to after jmp */
-				aPointer += 5 + *(__unaligned int32_t*) &aPointer[1]; // jmp +imm32
-			}
-			else if (aPointer[0] == 0xFF && aPointer[1] == 0x25)
-			{
-				/* far jmp */
-				/* x64: address is relative to after jmp */
-				/* x86: absolute address can be read directly */
+				if (aPointer[0] == 0xEB)
+				{
+					/* short jmp */
+					/* address is relative to after jmp */
+					aPointer += 2 + *(__unaligned int8_t*) & aPointer[1]; // jmp +imm8
+				}
+				else if (aPointer[0] == 0xE9)
+				{
+					/* near jmp */
+					/* address is relative to after jmp */
+					aPointer += 5 + *(__unaligned int32_t*) &aPointer[1]; // jmp +imm32
+				}
+				else if (aPointer[0] == 0xFF && aPointer[1] == 0x25)
+				{
+					/* far jmp */
+					/* x64: address is relative to after jmp */
+					/* x86: absolute address can be read directly */
 #ifdef _WIN64
-				aPointer += 6 + *(__unaligned int32_t*) &aPointer[2]; // jmp [+imm32]
+					aPointer += 6 + *(__unaligned int32_t*) &aPointer[2]; // jmp [+imm32]
 #else
-				aPointer = *(__unaligned int32_t*) &aPointer[2]; // jmp [imm32]
+					aPointer = *(__unaligned PBYTE*) &aPointer[2]; // jmp [imm32]
 #endif
-				/* dereference to get the actual target address */
-				aPointer = *(__unaligned PBYTE*)aPointer;
-			}
-			else
-			{
-				break;
+					/* dereference to get the actual target address */
+					aPointer = *(__unaligned PBYTE*)aPointer;
+				}
+				else
+				{
+					return aPointer;
+				}
 			}
 		}
+		__except (ReadFaultFilter(GetExceptionCode()))
+		{
+		}
 
-		return aPointer;
+		return nullptr;
+	}
+
+	///----------------------------------------------------------------------------------------------------
+	/// HexDigit:
+	/// 	Returns the value of a hexadecimal character, or -1 if it is none.
+	///----------------------------------------------------------------------------------------------------
+	constexpr int HexDigit(char aChar)
+	{
+		if (aChar >= '0' && aChar <= '9') { return aChar - '0'; }
+		if (aChar >= 'A' && aChar <= 'F') { return aChar - 'A' + 10; }
+		if (aChar >= 'a' && aChar <= 'f') { return aChar - 'a' + 10; }
+		return -1;
 	}
 
 	///----------------------------------------------------------------------------------------------------
@@ -124,18 +171,17 @@ namespace memtools
 
 			for (uint64_t i = 0; i < len; i++)
 			{
-				/* Pattern string not done, but already filled max byte length. */
-				if (this->Size >= MAX_PATTERN_LENGTH)
-				{
-					break;
-				}
-
 				/* Skip spaces. */
 				if (aPattern[i] == ' ') { continue; }
 
 				/* Skip angle brackets. (For marking significant bytes.)*/
 				if (aPattern[i] == '<') { continue; }
 				if (aPattern[i] == '>') { continue; }
+
+				if (this->Size >= MAX_PATTERN_LENGTH)
+				{
+					throw "Pattern exceeds MAX_PATTERN_LENGTH.";
+				}
 
 				/* Match wildcard. */
 				if (aPattern[i] == '?')
@@ -154,46 +200,19 @@ namespace memtools
 				}
 
 				/* Match hex. */
-				if ((aPattern[i] >= CHAR_0 && aPattern[i] <= CHAR_9) || (aPattern[i] >= CHAR_A && aPattern[i] <= CHAR_F))
+				int high = HexDigit(aPattern[i]);
+
+				if (high >= 0)
 				{
-					uint8_t val = 0;
+					uint8_t val = (uint8_t)high;
 
 					/* Match if double hex 'FF' instead of single hex 'F' */
-					if (i + 1 < len && (aPattern[i + 1] >= CHAR_0 && aPattern[i + 1] <= CHAR_9) || (aPattern[i + 1] >= CHAR_A && aPattern[i + 1] <= CHAR_F))
+					int low = i + 1 < len ? HexDigit(aPattern[i + 1]) : -1;
+
+					if (low >= 0)
 					{
-						/* Calculate byte value using position.*/
-						if (aPattern[i] <= CHAR_9)
-						{
-							val += (aPattern[i] - CHAR_0) * HEXPOW_2;
-						}
-						else
-						{
-							val += ((aPattern[i] - CHAR_A) + HEXVAL_A) * HEXPOW_2;
-						}
-
-						/* Calculate second hex value part of byte. */
-						if (aPattern[i + 1] <= CHAR_9)
-						{
-							val += (aPattern[i + 1] - CHAR_0) * HEXPOW_1;
-						}
-						else
-						{
-							val += ((aPattern[i + 1] - CHAR_A) + HEXVAL_A) * HEXPOW_1;
-						}
-
+						val = (uint8_t)(high * 0x10 + low);
 						i++;
-					}
-					else
-					{
-						/* Single hex value. */
-						if (aPattern[i] <= CHAR_9)
-						{
-							val += (aPattern[i] - CHAR_0) * HEXPOW_1;
-						}
-						else
-						{
-							val += ((aPattern[i] - CHAR_A) + HEXVAL_A) * HEXPOW_1;
-						}
 					}
 
 					this->Bytes[j] = Byte{ false, val };
@@ -404,233 +423,245 @@ namespace memtools
 
 		///----------------------------------------------------------------------------------------------------
 		/// Scan:
-		/// 	Scans for the memory pattern and returns its pointer if found.
+		/// 	Scans the module's memory for the pattern and returns its pointer if found.
+		/// 	Defaults to the main executable.
 		///----------------------------------------------------------------------------------------------------
 		template <typename T = void*>
-		inline T Scan() const
+		inline T Scan(HMODULE aModule = GetModuleHandleW(nullptr)) const
 		{
-			if (this->Assembly.Size == 0) { return nullptr; }
+			static_assert(std::is_pointer<T>::value, "Scan returns an address, T must be a pointer type.");
 
-			void* resultAddr = nullptr;
+			if (this->Assembly.Size == 0 || aModule == nullptr) { return (T)nullptr; }
 
-			PBYTE addr = 0;
+			PBYTE imageBase = (PBYTE)aModule;
+			PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)imageBase;
+			if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) { return (T)nullptr; }
 
-#ifdef ENABLE_PATTERN_CACHING
-			struct PatternMatch
-			{
-				memtools::Pattern Pattern;
-				void*             Address;
-			};
+			PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)(imageBase + dosHeader->e_lfanew);
+			if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) { return (T)nullptr; }
 
-			static std::mutex                s_PatternMatchMutex;
-			static std::vector<PatternMatch> s_PatternMatchStore;
-
-			{
-				const std::lock_guard<std::mutex> lock(s_PatternMatchMutex);
-				auto it = std::find_if(s_PatternMatchStore.begin(), s_PatternMatchStore.end(), [this](const PatternMatch& match)
-				{
-					return match.Pattern == this->Assembly;
-				});
-
-				/* If stored, start from stored address. */
-				if (it != s_PatternMatchStore.end())
-				{
-					addr = (PBYTE)it->Address;
-				}
-			}
-#endif
+			PBYTE imageEnd = imageBase + ntHeaders->OptionalHeader.SizeOfImage;
+			PBYTE addr = imageBase;
 
 			MEMORY_BASIC_INFORMATION mbi{};
 
-			while (resultAddr == nullptr)
+			while (addr < imageEnd && VirtualQuery(addr, &mbi, sizeof(mbi)))
 			{
-				/* If virtual query fails, stop scanning. */
-				if (!VirtualQuery(addr, &mbi, sizeof(mbi)))
+				PBYTE start = addr;
+				PBYTE end = (PBYTE)mbi.BaseAddress + mbi.RegionSize;
+				if (end > imageEnd) { end = imageEnd; }
+
+				addr = end;
+
+				if (!IsReadable(mbi)) { continue; }
+				if ((uint64_t)(end - start) < this->Assembly.Size) { continue; }
+
+				void* result = this->ScanRange(start, (uint64_t)(end - start));
+
+				if (result)
 				{
-					break;
+					return (T)result;
 				}
+			}
 
-				/* Advance query address into the next page. */
-				addr += mbi.RegionSize;
+			return (T)nullptr;
+		}
 
-				/* Sanity check: Page is smaller than bytes to match against. */
-				if (this->Assembly.Size > mbi.RegionSize)
+	private:
+		///----------------------------------------------------------------------------------------------------
+		/// ScanRange:
+		/// 	Matches the pattern at every position of the range. Stops at the end of the range if it becomes
+		/// 	unreadable while scanning, e.g. because it was freed.
+		///----------------------------------------------------------------------------------------------------
+		inline void* ScanRange(PBYTE aBase, uint64_t aSize) const
+		{
+			__try
+			{
+				uint64_t last = aSize - this->Assembly.Size;
+
+				for (uint64_t i = 0; i <= last; i++)
 				{
-					continue;
-				}
-
-				/* Skip uncommitted pages. */
-				if (mbi.State != MEM_COMMIT)
-				{
-					continue;
-				}
-
-				/* Skip pages without read permission. */
-				if (!(mbi.Protect == PAGE_EXECUTE_READ || mbi.Protect == PAGE_EXECUTE_READWRITE))
-				{
-					continue;
-				}
-
-				PBYTE base = (PBYTE)mbi.BaseAddress;
-				uint64_t end = mbi.RegionSize - this->Assembly.Size; // ensure not going out of bounds
-
-				bool isMatch = false;
-
-				for (uint64_t i = 0; i < end; i++)
-				{
-					isMatch = this->Assembly == &base[i];
-
-					if (isMatch)
+					if (this->Assembly == &aBase[i])
 					{
-#ifdef ENABLE_PATTERN_CACHING
+						void* result = this->TryExecute(&aBase[i]);
+
+						if (result)
 						{
-							const std::lock_guard<std::mutex> lock(s_PatternMatchMutex);
-							auto it = std::find_if(s_PatternMatchStore.begin(), s_PatternMatchStore.end(), [this](const PatternMatch& match)
-							{
-								return match.Pattern == this->Assembly;
-							});
-
-							/* If stored, start from stort address. */
-							if (it == s_PatternMatchStore.end())
-							{
-								s_PatternMatchStore.push_back(PatternMatch{ this->Assembly, base + i });
-							}
-						}
-#endif
-
-						resultAddr = base + i;
-
-						uint32_t instructionsFailed = 0;
-
-						std::vector<void*> addrStore{};
-
-						/* Track offsets for wildcard advancing. */
-						int64_t offsetFromMatch = 0;
-
-						for (const Instruction& inst : this->Instructions)
-						{
-							EOperation op = inst.Operation;
-
-							switch (op)
-							{
-								case EOperation::offset:
-								{
-									offsetFromMatch += inst.Value;
-									resultAddr = (PBYTE)resultAddr + inst.Value;
-									break;
-								}
-								case EOperation::follow:
-								{
-									resultAddr = FollowRelativeAddress((PBYTE)resultAddr);
-									break;
-								}
-								case EOperation::strcmp:
-								{
-									instructionsFailed += strcmp((const char*)FollowRelativeAddress(resultAddr), inst.String) == 0 ? 0 : 1;
-									break;
-								}
-								case EOperation::wcscmp:
-								{
-									instructionsFailed += wcscmp((const wchar_t*)FollowRelativeAddress(resultAddr), inst.WString) == 0 ? 0 : 1;
-									break;
-								}
-								case EOperation::cmpi8:
-								{
-									instructionsFailed += *((int8_t*)resultAddr) == (int8_t)inst.Value ? 0 : 1;
-									break;
-								}
-								case EOperation::cmpi16:
-								{
-									instructionsFailed += *((int16_t*)resultAddr) == (int16_t)inst.Value ? 0 : 1;
-									break;
-								}
-								case EOperation::cmpi32:
-								{
-									instructionsFailed += *((int32_t*)resultAddr) == (int32_t)inst.Value ? 0 : 1;
-									break;
-								}
-								case EOperation::cmpi64:
-								{
-									instructionsFailed += *((int64_t*)resultAddr) == (int64_t)inst.Value ? 0 : 1;
-									break;
-								}
-								case EOperation::pushaddr:
-								{
-									addrStore.push_back(resultAddr);
-									break;
-								}
-								case EOperation::popaddr:
-								{
-									resultAddr = addrStore.back();
-									addrStore.pop_back();
-									break;
-								}
-								case EOperation::advwcard:
-								{
-									/* Advance as many sets as in the parameter. */
-									for (int64_t i = 0; i < inst.Value; i++)
-									{
-										bool wasAtWildcard = this->Assembly.Bytes[offsetFromMatch].IsWildcard;
-										bool foundWildcard = false;
-
-										while (offsetFromMatch < (int64_t)this->Assembly.Size)
-										{
-											if (wasAtWildcard && this->Assembly.Bytes[offsetFromMatch].IsWildcard)
-											{
-												offsetFromMatch++;
-											}
-											else if (!wasAtWildcard && this->Assembly.Bytes[offsetFromMatch].IsWildcard)
-											{
-												break;
-											}
-											else
-											{
-												offsetFromMatch++;
-												wasAtWildcard = false;
-											}
-										}
-									}
-
-									resultAddr = base + i + offsetFromMatch;
-
-									break;
-								}
-								case EOperation::funcentry:
-								{
-									DWORD64 imageBase = 0;
-									PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(reinterpret_cast<DWORD64>(resultAddr), &imageBase, nullptr);
-
-									if (!function)
-									{
-										instructionsFailed++;
-										break;
-									}
-
-									resultAddr = reinterpret_cast<void*>(imageBase + function->BeginAddress);
-									break;
-								}
-								default:
-									break;
-							}
-
-							if (instructionsFailed)
-							{
-								/* interrupt if any failed */
-								resultAddr = nullptr;
-								break;
-							}
-						}
-
-						if (!instructionsFailed)
-						{
-							/* the instructions were all executed, we interrupt the byte iteration */
-							break;
+							return result;
 						}
 					}
 				}
 			}
+			__except (ReadFaultFilter(GetExceptionCode()))
+			{
+			}
 
-			return (T)resultAddr;
+			return nullptr;
+		}
+
+		///----------------------------------------------------------------------------------------------------
+		/// TryExecute:
+		/// 	Runs the instructions on a match. A read fault fails the match.
+		///----------------------------------------------------------------------------------------------------
+		inline void* TryExecute(PBYTE aMatch) const
+		{
+			__try
+			{
+				return this->Execute(aMatch);
+			}
+			__except (ReadFaultFilter(GetExceptionCode()))
+			{
+				return nullptr;
+			}
+		}
+
+		///----------------------------------------------------------------------------------------------------
+		/// Execute:
+		/// 	Runs the instructions on a match and returns the resulting address, or nullptr if any failed.
+		///----------------------------------------------------------------------------------------------------
+		inline void* Execute(PBYTE aMatch) const
+		{
+			struct AddrFrame
+			{
+				void*   Address;
+				int64_t OffsetFromMatch;
+				bool    IsInPattern;
+			};
+
+			AddrFrame addrStore[MAX_INSTRUCTION_LENGTH];
+			std::size_t addrStoreCount = 0;
+
+			void* resultAddr = aMatch;
+
+			/* Track offsets for wildcard advancing, only meaningful while the address is relative to the match. */
+			int64_t offsetFromMatch = 0;
+			bool    isInPattern     = true;
+
+			for (std::size_t n = 0; n < this->Count; n++)
+			{
+				const Instruction& inst = this->Instructions[n];
+
+				switch (inst.Operation)
+				{
+					case EOperation::offset:
+					{
+						if (isInPattern)
+						{
+							offsetFromMatch += inst.Value;
+						}
+
+						resultAddr = (PBYTE)resultAddr + inst.Value;
+						break;
+					}
+					case EOperation::follow:
+					{
+						resultAddr = FollowRelativeAddress((PBYTE)resultAddr);
+						isInPattern = false;
+						break;
+					}
+					case EOperation::strcmp:
+					{
+						if (strcmp((const char*)FollowRelativeAddress(resultAddr), inst.String) != 0) { return nullptr; }
+						break;
+					}
+					case EOperation::wcscmp:
+					{
+						if (wcscmp((const wchar_t*)FollowRelativeAddress(resultAddr), inst.WString) != 0) { return nullptr; }
+						break;
+					}
+					case EOperation::cmpi8:
+					{
+						if (*((int8_t*)resultAddr) != (int8_t)inst.Value) { return nullptr; }
+						break;
+					}
+					case EOperation::cmpi16:
+					{
+						if (*((int16_t*)resultAddr) != (int16_t)inst.Value) { return nullptr; }
+						break;
+					}
+					case EOperation::cmpi32:
+					{
+						if (*((int32_t*)resultAddr) != (int32_t)inst.Value) { return nullptr; }
+						break;
+					}
+					case EOperation::cmpi64:
+					{
+						if (*((int64_t*)resultAddr) != (int64_t)inst.Value) { return nullptr; }
+						break;
+					}
+					case EOperation::pushaddr:
+					{
+						addrStore[addrStoreCount++] = AddrFrame{ resultAddr, offsetFromMatch, isInPattern };
+						break;
+					}
+					case EOperation::popaddr:
+					{
+						assert(addrStoreCount > 0 && "PopAddr without a matching PushAddr.");
+						if (addrStoreCount == 0) { return nullptr; }
+
+						const AddrFrame& frame = addrStore[--addrStoreCount];
+						resultAddr      = frame.Address;
+						offsetFromMatch = frame.OffsetFromMatch;
+						isInPattern     = frame.IsInPattern;
+						break;
+					}
+					case EOperation::advwcard:
+					{
+						/* Wildcard sets only exist relative to the match. */
+						if (!isInPattern) { return nullptr; }
+
+						const int64_t size = (int64_t)this->Assembly.Size;
+
+						/* Advance as many sets as in the parameter. */
+						for (int64_t set = 0; set < inst.Value; set++)
+						{
+							bool wasAtWildcard = offsetFromMatch >= 0 && offsetFromMatch < size && this->Assembly.Bytes[offsetFromMatch].IsWildcard;
+
+							if (offsetFromMatch < 0)
+							{
+								offsetFromMatch = 0;
+							}
+
+							while (offsetFromMatch < size)
+							{
+								if (wasAtWildcard && this->Assembly.Bytes[offsetFromMatch].IsWildcard)
+								{
+									offsetFromMatch++;
+								}
+								else if (!wasAtWildcard && this->Assembly.Bytes[offsetFromMatch].IsWildcard)
+								{
+									break;
+								}
+								else
+								{
+									offsetFromMatch++;
+									wasAtWildcard = false;
+								}
+							}
+
+							if (offsetFromMatch >= size) { return nullptr; }
+						}
+
+						resultAddr = aMatch + offsetFromMatch;
+						break;
+					}
+					case EOperation::funcentry:
+					{
+						DWORD64 imageBase = 0;
+						PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(reinterpret_cast<DWORD64>(resultAddr), &imageBase, nullptr);
+
+						if (!function) { return nullptr; }
+
+						resultAddr = reinterpret_cast<void*>(imageBase + function->BeginAddress);
+						isInPattern = false;
+						break;
+					}
+					default:
+						break;
+				}
+			}
+
+			return resultAddr;
 		}
 	};
 
@@ -657,11 +688,13 @@ namespace memtools
 		/// 	Performs the datascans sequentially, returning if one succeeds. Otherwise returns nullptr.
 		///----------------------------------------------------------------------------------------------------
 		template <typename T = void*>
-		inline T Scan() const
+		inline T Scan(HMODULE aModule = GetModuleHandleW(nullptr)) const
 		{
+			static_assert(std::is_pointer<T>::value, "Scan returns an address, T must be a pointer type.");
+
 			for (const PatternScan& scan : this->Scans)
 			{
-				void* result = scan.Scan();
+				void* result = scan.Scan(aModule);
 
 				if (result)
 				{
@@ -672,6 +705,219 @@ namespace memtools
 			return (T)nullptr;
 		}
 	};
+
+	///----------------------------------------------------------------------------------------------------
+	/// ThreadSuspension Struct
+	/// 	Suspends all other threads of the process for its lifetime.
+	///----------------------------------------------------------------------------------------------------
+	struct ThreadSuspension
+	{
+		std::vector<HANDLE> Threads;
+
+		ThreadSuspension(const ThreadSuspension&) = delete;
+		ThreadSuspension& operator=(const ThreadSuspension&) = delete;
+
+		///----------------------------------------------------------------------------------------------------
+		/// ctor
+		///----------------------------------------------------------------------------------------------------
+		inline ThreadSuspension()
+		{
+			HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+			if (snapshot == INVALID_HANDLE_VALUE) { return; }
+
+			const DWORD processId = GetCurrentProcessId();
+			const DWORD threadId  = GetCurrentThreadId();
+
+			THREADENTRY32 entry{};
+			entry.dwSize = sizeof(entry);
+
+			for (BOOL ok = Thread32First(snapshot, &entry); ok; ok = Thread32Next(snapshot, &entry))
+			{
+				if (entry.th32OwnerProcessID != processId || entry.th32ThreadID == threadId) { continue; }
+
+				HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, entry.th32ThreadID);
+
+				if (thread)
+				{
+					this->Threads.push_back(thread);
+				}
+			}
+
+			CloseHandle(snapshot);
+
+			/* Nothing may allocate while threads are suspended, one of them could hold the heap lock. */
+			for (HANDLE thread : this->Threads)
+			{
+				SuspendThread(thread);
+			}
+		}
+
+		///----------------------------------------------------------------------------------------------------
+		/// dtor
+		///----------------------------------------------------------------------------------------------------
+		inline ~ThreadSuspension()
+		{
+			for (HANDLE thread : this->Threads)
+			{
+				ResumeThread(thread);
+				CloseHandle(thread);
+			}
+		}
+
+		///----------------------------------------------------------------------------------------------------
+		/// IsExecuting:
+		/// 	Returns true if a suspended thread stopped inside the range, past its first byte.
+		///----------------------------------------------------------------------------------------------------
+		inline bool IsExecuting(uintptr_t aStart, uintptr_t aEnd) const
+		{
+			for (HANDLE thread : this->Threads)
+			{
+				CONTEXT context{};
+				context.ContextFlags = CONTEXT_CONTROL;
+
+				if (!GetThreadContext(thread, &context)) { continue; }
+
+#ifdef _WIN64
+				const uintptr_t ip = context.Rip;
+#else
+				const uintptr_t ip = context.Eip;
+#endif
+
+				if (ip > aStart && ip < aEnd)
+				{
+					return true;
+				}
+			}
+
+			return false;
+		}
+	};
+
+	///----------------------------------------------------------------------------------------------------
+	/// WriteAtomic:
+	/// 	Writes the bytes with a single atomic store, if they fit into one aligned 8 byte block.
+	/// 	Copies the replaced bytes into aOutOriginal, if not nullptr.
+	///----------------------------------------------------------------------------------------------------
+	inline bool WriteAtomic(uintptr_t aStart, const uint8_t* aBytes, uint8_t* aOutOriginal, size_t aSize)
+	{
+		const uintptr_t block = aStart & ~(uintptr_t)7;
+
+		if (aStart + aSize > block + 8) { return false; }
+
+		volatile LONG64* target = (volatile LONG64*)block;
+		LONG64 current = 0;
+		LONG64 next    = 0;
+
+		do
+		{
+			current = *target;
+			next    = current;
+			memcpy((uint8_t*)&next + (aStart - block), aBytes, aSize);
+		}
+		while (InterlockedCompareExchange64(target, next, current) != current);
+
+		if (aOutOriginal)
+		{
+			memcpy(aOutOriginal, (uint8_t*)&current + (aStart - block), aSize);
+		}
+
+		return true;
+	}
+
+	///----------------------------------------------------------------------------------------------------
+	/// WriteSuspended:
+	/// 	Writes the bytes while all other threads are suspended and none of them is inside the range.
+	/// 	Copies the replaced bytes into aOutOriginal, if not nullptr.
+	///----------------------------------------------------------------------------------------------------
+	inline bool WriteSuspended(uintptr_t aStart, const uint8_t* aBytes, uint8_t* aOutOriginal, size_t aSize)
+	{
+		for (int attempt = 0; attempt < 50; attempt++)
+		{
+			{
+				ThreadSuspension suspension;
+
+				if (!suspension.IsExecuting(aStart, aStart + aSize))
+				{
+					if (aOutOriginal)
+					{
+						memcpy(aOutOriginal, (void*)aStart, aSize);
+					}
+
+					memcpy((void*)aStart, aBytes, aSize);
+					return true;
+				}
+			}
+
+			Sleep(1);
+		}
+
+		return false;
+	}
+
+	///----------------------------------------------------------------------------------------------------
+	/// WriteCode:
+	/// 	Writes bytes to memory that other threads may be executing. Every page keeps its own protection.
+	/// 	Copies the replaced bytes into aOutOriginal, if not nullptr.
+	///----------------------------------------------------------------------------------------------------
+	inline bool WriteCode(void* aTarget, const uint8_t* aBytes, uint8_t* aOutOriginal, size_t aSize)
+	{
+		const uintptr_t start = (uintptr_t)aTarget;
+		const uintptr_t end   = start + aSize;
+
+		SYSTEM_INFO sysInfo{};
+		GetSystemInfo(&sysInfo);
+		const uintptr_t pageSize = sysInfo.dwPageSize;
+
+		struct PageProtection
+		{
+			void* Page;
+			DWORD Protect;
+		};
+
+		std::vector<PageProtection> pages;
+
+		bool success = true;
+
+		for (uintptr_t page = start & ~(pageSize - 1); page < end; page += pageSize)
+		{
+			MEMORY_BASIC_INFORMATION mbi{};
+
+			if (!VirtualQuery((void*)page, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT)
+			{
+				success = false;
+				break;
+			}
+
+			const DWORD executable = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+			DWORD oldProtect = 0;
+
+			if (!VirtualProtect((void*)page, 1, (mbi.Protect & executable) ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE, &oldProtect))
+			{
+				success = false;
+				break;
+			}
+
+			pages.push_back(PageProtection{ (void*)page, oldProtect });
+		}
+
+		if (success)
+		{
+			success = WriteAtomic(start, aBytes, aOutOriginal, aSize) || WriteSuspended(start, aBytes, aOutOriginal, aSize);
+		}
+
+		if (success)
+		{
+			FlushInstructionCache(GetCurrentProcess(), aTarget, aSize);
+		}
+
+		for (const PageProtection& page : pages)
+		{
+			DWORD oldProtect = 0;
+			VirtualProtect(page.Page, 1, page.Protect, &oldProtect);
+		}
+
+		return success;
+	}
 
 	///----------------------------------------------------------------------------------------------------
 	/// Patch Struct
@@ -694,27 +940,15 @@ namespace memtools
 			if (aBytes == nullptr)  { throw "Patch Bytes are nullptr."; }
 			if (aSize == 0)         { throw "Patch Bytes are size 0."; }
 
-			this->Target = aTarget;
-			this->Size = aSize;
-			this->OriginalBytes.resize(this->Size);
+			this->OriginalBytes.resize(aSize);
 
-			DWORD oldProtect;
-			if (!VirtualProtect(this->Target, this->Size, PAGE_EXECUTE_READWRITE, &oldProtect))
+			if (!WriteCode(aTarget, aBytes, this->OriginalBytes.data(), aSize))
 			{
-				throw "Failed to change page protection.";
+				throw "Failed to write the patch.";
 			}
-			
-			/* Copy the original bytes. */
-			memcpy(this->OriginalBytes.data(), this->Target, this->Size);
 
-			/* Write the new bytes. */
-			memcpy(this->Target, aBytes, this->Size);
-
-			/* Flush the instruction cache. */
-			FlushInstructionCache(GetCurrentProcess(), this->Target, this->Size);
-
-			/* Restore page protection. */
-			VirtualProtect(this->Target, this->Size, oldProtect, &oldProtect);
+			this->Target = aTarget;
+			this->Size   = aSize;
 		}
 
 		///----------------------------------------------------------------------------------------------------
@@ -727,18 +961,7 @@ namespace memtools
 				return;
 			}
 
-			DWORD oldProtect;
-			if (VirtualProtect(this->Target, this->Size, PAGE_EXECUTE_READWRITE, &oldProtect))
-			{
-				/* Restore original bytes. */
-				memcpy(this->Target, this->OriginalBytes.data(), this->Size);
-
-				/* Flush the instruction cache. */
-				FlushInstructionCache(GetCurrentProcess(), this->Target, this->Size);
-
-				/* Restore page protection. */
-				VirtualProtect(this->Target, this->Size, oldProtect, &oldProtect);
-			}
+			WriteCode(this->Target, this->OriginalBytes.data(), nullptr, this->Size);
 		}
 	};
 }
