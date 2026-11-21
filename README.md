@@ -2,10 +2,36 @@
 x64 single header C++ memory tools for pattern scanning, verification and navigation.
 
 # Usage
-These defines can be set before including `memtools.h`:
+These defines can be set in `memtools_config.h` (see [Configuration](#configuration)) or before including `memtools.h`:
 - `MAX_PATTERN_LENGTH` - Maximum bytes in a pattern. Default `128`.
 - `MAX_INSTRUCTION_LENGTH` - Maximum instructions per scan. Default `16`.
 - `MAX_JMP_CHAIN` - Maximum jmps `FollowJmpChain` follows. Default `32`.
+- `MEMTOOLS_BYTE_RARITY` - Optional byte rarity table to speed up scans. Not defined by default. See [Byte rarity](#byte-rarity).
+
+## Configuration
+`memtools.h` includes `memtools_config.h` if one is found on the include path. It is optional: without it the defaults above are used.
+
+Put `memtools_config.h` in your own project (not in the memtools folder), in a directory on the include path. Because `memtools.h` includes it itself, every translation unit sees the same configuration without a wrapper header.
+
+```
+YourProject/
+├── memtools/              (this repository, e.g. a submodule)
+│   └── memtools.h
+└── memtools_config.h      (yours; YourProject/ is on the include path)
+```
+
+## Byte rarity
+A scan first looks for two fixed bytes of the pattern (the anchors) and fully compares only the positions where both match.
+Without `MEMTOOLS_BYTE_RARITY` the anchors are the first and last fixed bytes of the pattern.
+
+Defining `MEMTOOLS_BYTE_RARITY` lets the scan pick the two rarest fixed bytes instead, so fewer positions need a full comparison. It is a braced initializer of 256 values, one per byte value `0x00`-`0xFF`, each `round(-log2(frequency))` of that byte in the code you scan (higher = rarer). The table is specific to the program it was measured on. It only affects speed, never results.
+
+```cpp
+/* memtools_config.h */
+#define MEMTOOLS_BYTE_RARITY { 3, 6, 7, 7, /* ... 256 values ... */ 9, 5 }
+```
+
+To measure a table, count how often each byte value occurs in the target's `.text` section and store `round(-log2(count / total))`, clamped to a byte.
 
 ## Patterns
 Patterns are constexpr-compatible to parse at compile-time.

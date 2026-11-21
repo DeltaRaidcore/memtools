@@ -21,6 +21,17 @@
 #include <type_traits>
 #include <vector>
 
+#if defined(_M_X64) || defined(_M_AMD64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+#include <emmintrin.h>
+#include <intrin.h>
+#define MEMTOOLS_SSE2 1
+#endif
+
+/* Optional user configuration, e.g. MEMTOOLS_BYTE_RARITY. Searched for on the include path. */
+#if __has_include("memtools_config.h")
+#include "memtools_config.h"
+#endif
+
 #ifndef MAX_PATTERN_LENGTH
 #define MAX_PATTERN_LENGTH     128
 #endif
@@ -468,22 +479,172 @@ namespace memtools
 		}
 
 	private:
+#ifdef MEMTOOLS_BYTE_RARITY
+		///----------------------------------------------------------------------------------------------------
+		/// ByteRarity:
+		/// 	Rarity of a byte value in the scanned code, as -log2 of its frequency, from the
+		/// 	MEMTOOLS_BYTE_RARITY table in memtools_config.h. Used to pick the anchor bytes that rule out
+		/// 	the most positions.
+		/// 	Only affects speed, never results.
+		///----------------------------------------------------------------------------------------------------
+		static inline uint8_t ByteRarity(uint8_t aValue)
+		{
+			static constexpr uint8_t s_Rarity[256] = MEMTOOLS_BYTE_RARITY;
+
+			return s_Rarity[aValue];
+		}
+
+		///----------------------------------------------------------------------------------------------------
+		/// SelectAnchors:
+		/// 	Picks the two non-wildcard bytes of the pattern that are rarest together (preferring ones further
+		/// 	apart, as neighbouring bytes correlate). Both are the same byte if the pattern only has one.
+		/// 	Returns false if the pattern is all wildcards.
+		///----------------------------------------------------------------------------------------------------
+		inline bool SelectAnchors(uint64_t& aFirst, uint64_t& aSecond) const
+		{
+			int bestScore = -1;
+
+			for (uint64_t i = 0; i < this->Assembly.Size; i++)
+			{
+				if (this->Assembly.Bytes[i].IsWildcard) { continue; }
+
+				const int rarityI = ByteRarity(this->Assembly.Bytes[i].Value);
+
+				if (bestScore < 0)
+				{
+					/* Fallback for single-byte patterns. */
+					aFirst = aSecond = i;
+					bestScore = 0;
+				}
+
+				for (uint64_t j = i + 1; j < this->Assembly.Size; j++)
+				{
+					if (this->Assembly.Bytes[j].IsWildcard) { continue; }
+
+					/* Rarity in 1/8 bits, plus a small bonus for distance. */
+					const int score = (rarityI + ByteRarity(this->Assembly.Bytes[j].Value)) * 8 + (int)(j - i > 7 ? 7 : j - i);
+
+					if (score > bestScore)
+					{
+						bestScore = score;
+						aFirst = i;
+						aSecond = j;
+					}
+				}
+			}
+
+			return bestScore >= 0;
+		}
+#else
+		///----------------------------------------------------------------------------------------------------
+		/// SelectAnchors:
+		/// 	Picks the first and last non-wildcard bytes of the pattern. Both are the same byte if the pattern
+		/// 	only has one. Returns false if the pattern is all wildcards.
+		/// 	Define MEMTOOLS_BYTE_RARITY in memtools_config.h to pick the rarest bytes instead.
+		///----------------------------------------------------------------------------------------------------
+		inline bool SelectAnchors(uint64_t& aFirst, uint64_t& aSecond) const
+		{
+			bool found = false;
+
+			for (uint64_t i = 0; i < this->Assembly.Size; i++)
+			{
+				if (this->Assembly.Bytes[i].IsWildcard) { continue; }
+
+				if (!found)
+				{
+					aFirst = i;
+					found = true;
+				}
+
+				aSecond = i;
+			}
+
+			return found;
+		}
+#endif
+
+		///----------------------------------------------------------------------------------------------------
+		/// MatchAt:
+		/// 	Fully verifies a candidate position and runs the instructions on a match.
+		///----------------------------------------------------------------------------------------------------
+		inline void* MatchAt(PBYTE aCandidate) const
+		{
+			if (this->Assembly == aCandidate)
+			{
+				return this->TryExecute(aCandidate);
+			}
+
+			return nullptr;
+		}
+
 		///----------------------------------------------------------------------------------------------------
 		/// ScanRange:
-		/// 	Matches the pattern at every position of the range. Stops at the end of the range if it becomes
-		/// 	unreadable while scanning, e.g. because it was freed.
+		/// 	Returns the first position of the range where the pattern matches and the instructions succeed.
+		/// 	Candidates are found by comparing two anchor bytes of the pattern 16 positions at a time, then
+		/// 	verified in ascending order. Stops at the end of the range if it becomes unreadable while
+		/// 	scanning, e.g. because it was freed.
 		///----------------------------------------------------------------------------------------------------
 		inline void* ScanRange(PBYTE aBase, uint64_t aSize) const
 		{
+			uint64_t anchorA = 0;
+			uint64_t anchorB = 0;
+			const bool hasAnchors = this->SelectAnchors(anchorA, anchorB);
+
 			__try
 			{
-				uint64_t last = aSize - this->Assembly.Size;
+				/* Positions 0..last are candidates. Reads never go past aBase + aSize. */
+				const uint64_t last = aSize - this->Assembly.Size;
+				uint64_t i = 0;
 
-				for (uint64_t i = 0; i <= last; i++)
+				if (hasAnchors)
 				{
-					if (this->Assembly == &aBase[i])
+#ifdef MEMTOOLS_SSE2
+					const __m128i valueA = _mm_set1_epi8((char)this->Assembly.Bytes[anchorA].Value);
+					const __m128i valueB = _mm_set1_epi8((char)this->Assembly.Bytes[anchorB].Value);
+
+					/* Every position i..i+15 must be a candidate, so i + 15 <= last. */
+					for (; last >= 15 && i <= last - 15; i += 16)
 					{
-						void* result = this->TryExecute(&aBase[i]);
+						const __m128i eqA = _mm_cmpeq_epi8(_mm_loadu_si128((const __m128i*)(aBase + i + anchorA)), valueA);
+						const __m128i eqB = _mm_cmpeq_epi8(_mm_loadu_si128((const __m128i*)(aBase + i + anchorB)), valueB);
+						unsigned int mask = (unsigned int)_mm_movemask_epi8(_mm_and_si128(eqA, eqB));
+
+						while (mask)
+						{
+							unsigned long bit;
+							_BitScanForward(&bit, mask);
+							mask &= mask - 1;
+
+							void* result = this->MatchAt(aBase + i + bit);
+
+							if (result)
+							{
+								return result;
+							}
+						}
+					}
+#endif
+					const uint8_t byteA = this->Assembly.Bytes[anchorA].Value;
+					const uint8_t byteB = this->Assembly.Bytes[anchorB].Value;
+
+					for (; i <= last; i++)
+					{
+						if (aBase[i + anchorA] != byteA || aBase[i + anchorB] != byteB) { continue; }
+
+						void* result = this->MatchAt(aBase + i);
+
+						if (result)
+						{
+							return result;
+						}
+					}
+				}
+				else
+				{
+					/* All wildcards: every position matches. */
+					for (; i <= last; i++)
+					{
+						void* result = this->TryExecute(aBase + i);
 
 						if (result)
 						{
@@ -794,15 +955,35 @@ namespace memtools
 	};
 
 	///----------------------------------------------------------------------------------------------------
+	/// GetAtomicBlock:
+	/// 	Returns the start of an 8 byte block that covers the range and can be written with one locked
+	/// 	operation, or 0 if there is none. Prefers the aligned block. Otherwise any 8 byte window inside
+	/// 	the same 64 byte cache line, x86 locked operations are atomic within a cache line.
+	///----------------------------------------------------------------------------------------------------
+	inline uintptr_t GetAtomicBlock(uintptr_t aStart, size_t aSize)
+	{
+		if (aSize == 0 || aSize > 8) { return 0; }
+
+		const uintptr_t aligned = aStart & ~(uintptr_t)7;
+		if (aStart + aSize <= aligned + 8) { return aligned; }
+
+		const uintptr_t line = aStart & ~(uintptr_t)63;
+		if (aStart + aSize > line + 64) { return 0; }
+
+		/* Window inside the line that still covers the range. */
+		return (aStart + 8 <= line + 64) ? aStart : line + 64 - 8;
+	}
+
+	///----------------------------------------------------------------------------------------------------
 	/// WriteAtomic:
-	/// 	Writes the bytes with a single atomic store, if they fit into one aligned 8 byte block.
+	/// 	Writes the bytes with a single atomic store, if they fit into one 8 byte block within a cache line.
 	/// 	Copies the replaced bytes into aOutOriginal, if not nullptr.
 	///----------------------------------------------------------------------------------------------------
 	inline bool WriteAtomic(uintptr_t aStart, const uint8_t* aBytes, uint8_t* aOutOriginal, size_t aSize)
 	{
-		const uintptr_t block = aStart & ~(uintptr_t)7;
+		const uintptr_t block = GetAtomicBlock(aStart, aSize);
 
-		if (aStart + aSize > block + 8) { return false; }
+		if (block == 0) { return false; }
 
 		volatile LONG64* target = (volatile LONG64*)block;
 		LONG64 current = 0;
@@ -917,6 +1098,53 @@ namespace memtools
 		}
 
 		return success;
+	}
+
+	///----------------------------------------------------------------------------------------------------
+	/// AllocateNear:
+	/// 	Allocates executable memory within reach of a rel32 operand at aNear (+-2GB).
+	/// 	Returns nullptr if no free region is in range.
+	///----------------------------------------------------------------------------------------------------
+	inline void* AllocateNear(void* aNear, size_t aSize)
+	{
+		SYSTEM_INFO sysInfo{};
+		GetSystemInfo(&sysInfo);
+		const uintptr_t granularity = sysInfo.dwAllocationGranularity;
+
+		const uintptr_t origin = (uintptr_t)aNear;
+		const uintptr_t reach  = 0x7FFF0000; // Leaves room for the allocation itself.
+		const uintptr_t minApp = (uintptr_t)sysInfo.lpMinimumApplicationAddress;
+		const uintptr_t maxApp = (uintptr_t)sysInfo.lpMaximumApplicationAddress;
+
+		const uintptr_t low  = (origin > minApp + reach) ? origin - reach : minApp;
+		const uintptr_t high = (origin < maxApp - reach) ? origin + reach : maxApp;
+
+		/* Closest first: alternate below and above. */
+		uintptr_t down = (origin & ~(granularity - 1));
+		uintptr_t up   = down + granularity;
+
+		while (down >= low || up <= high)
+		{
+			for (uintptr_t* cursor : { &down, &up })
+			{
+				const uintptr_t addr = *cursor;
+				if (addr < low || addr > high) { continue; }
+
+				MEMORY_BASIC_INFORMATION mbi{};
+				if (VirtualQuery((void*)addr, &mbi, sizeof(mbi)) && mbi.State == MEM_FREE)
+				{
+					void* result = VirtualAlloc((void*)addr, aSize, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+					if (result) { return result; }
+				}
+			}
+
+			if (down >= low + granularity) { down -= granularity; } else { down = 0; }
+			up += granularity;
+
+			if (down < low && up > high) { break; }
+		}
+
+		return nullptr;
 	}
 
 	///----------------------------------------------------------------------------------------------------
